@@ -74,12 +74,15 @@ class SummaryCommand(base.BaseCommand):
 def _table(df: pd.DataFrame) -> str:
   """Renders one row per trajectory; unreported quantities print as `-`."""
   steps = df[["steps_agent", "steps_user", "steps_system", "steps_other"]]
-  tokens = [
-      None if pd.isna(p) else str(stats.TokenCounts(int(p), int(c), int(k)))
-      for p, c, k in zip(
-          df["tokens_prompt"], df["tokens_completion"], df["tokens_cached"]
-      )
-  ]
+  # The nullable "Int64" columns hold `pd.NA` for a count the trajectory does
+  # not report; `object` dtype plus `where` turns the cells into the Python
+  # ints and Nones that `TokenCounts.from_fields` takes.
+  token_columns = df[[f"tokens_{field}" for field in stats.TokenCounts._fields]]
+  token_cells = token_columns.astype(object).where(token_columns.notna(), None)
+  tokens: list[str | None] = []
+  for row in token_cells.itertuples(index=False):
+    counts = stats.TokenCounts.from_fields(*row)
+    tokens.append(None if counts is None else str(counts))
   table = pd.DataFrame({
       "trajectory": df["trajectory_id"],
       "status": df["status"],
