@@ -943,6 +943,44 @@ def _create_vllm_sampler(args, tokenizer):
   return sampler_adapter, config
 
 
+async def shutdown_rollout_worker(server: Any, worker_service: Any) -> None:
+  """Stops a rollout worker without handing cancelled work back.
+
+  The gRPC server is stopped first, with no grace period. That aborts the
+  orchestrator's outstanding long-poll and refuses new RPCs, so the
+  orchestrator evicts this worker and re-queues every request it dispatched
+  here. Only then are the in-flight trajectories cancelled and the engine shut
+  down.
+
+  The reverse order lost one trajectory per planned scale-in: the cancelled
+  trajectories became TrajectoryErrors on the response queue while the server
+  was still inside its stop grace period, so the one long-poll already waiting
+  returned a cancelled trajectory. The orchestrator took it as a finished
+  rollout with status FAILED and counted a terminal failure instead of
+  re-queueing it.
+
+  Args:
+    server: The worker's GrpcRemoteExecutionServer.
+    worker_service: The RolloutWorker bound to `server`.
+  """
+  logging.info("Draining rollout worker...")
+  try:
+    # Close the door first: no response may leave this process after
+    # cancellation starts.
+    await server.stop_serving(grace=0)
+  except Exception:  # pylint: disable=broad-exception-caught
+    logging.exception("Failed to stop the rollout gRPC server.")
+  try:
+    # Cancel in-flight trajectory collections.
+    worker_service.stop()
+    if hasattr(worker_service.sampler, "stop"):
+      # Shut down vLLM engine.
+      await worker_service.sampler.stop()
+    logging.info("Rollout worker drained.")
+  except Exception:  # pylint: disable=broad-exception-caught
+    logging.exception("Failed to drain rollout worker cleanly.")
+
+
 def main(argv: list[str], context: Any = None) -> None:
   if context and context.ipc and context.ipc.discovery:
     pass
@@ -1032,17 +1070,7 @@ def main(argv: list[str], context: Any = None) -> None:
     except asyncio.CancelledError:
       pass
     finally:
-      logging.info("Draining rollout worker...")
-      try:
-        # Cancel in-flight trajectory collections
-        worker_service.stop()
-        if hasattr(worker_service.sampler, "stop"):
-          # Shut down vLLM engine
-          await worker_service.sampler.stop()
-        logging.info("Rollout worker drained.")
-      except Exception:
-        logging.exception("Failed to drain rollout worker cleanly.")
-      await server.stop_serving()
+      await shutdown_rollout_worker(server, worker_service)
 
   asyncio.run(grpc_server_main())
 
